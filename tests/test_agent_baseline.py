@@ -135,3 +135,4 @@ class TestBaselineAgent:
             assert result["total_expansions"] == result["initial_expansions"] + result["replan_expansions"]
             assert len(result["replan_latencies_ms"]) == result["replans"]
             assert math.isclose(result["total_replan_time_ms"], sum(result["replan_latencies_ms"]), rel_tol=1e-5, abs_tol=1e-5)
+

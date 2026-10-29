@@ -213,3 +213,4 @@ def run_baseline_agent(
         "replan_latencies_ms": replan_latencies_ms,
         "total_replan_time_ms": sum(replan_latencies_ms),
     }
+
