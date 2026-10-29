@@ -85,3 +85,4 @@ class TestEvents:
         assert changed == []
         assert sample_graph["A"]["B"]["travel_time"] == 10.0
         assert sample_graph["B"]["C"]["travel_time"] == 15.0
+

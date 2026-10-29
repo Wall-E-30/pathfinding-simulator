@@ -78,3 +78,4 @@ def apply_events(
             changed_edges.append((event.u, event.v, old_cost, new_cost))
 
     return changed_edges
+
