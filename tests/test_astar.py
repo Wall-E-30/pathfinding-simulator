@@ -9,19 +9,14 @@ from typing import Any
 import networkx as nx
 import pytest
 
-from src.astar import plan
+from src.astar import plan, run_astar_agent
+from src.events import Event
 from src.graph_utils import compute_v_max, haversine_m
 
 
 @pytest.fixture(scope="module")
 def grid_network() -> nx.DiGraph:
-    """Fixture providing an 8x8 directed grid street network with coordinates and travel times.
-
-    Viva note:
-        A regular grid network with cross-streets provides multiple alternate paths
-        between any two points, making it an ideal benchmark to evaluate search efficiency
-        and compare A* node expansions against Dijkstra.
-    """
+    """Fixture providing an 8x8 directed grid street network with coordinates and travel times."""
     g = nx.DiGraph()
     rows, cols = 8, 8
 
@@ -41,7 +36,6 @@ def grid_network() -> nx.DiGraph:
             if c + 1 < cols:
                 v = r * cols + (c + 1)
                 dist_m = haversine_m(g.nodes[u]["y"], g.nodes[u]["x"], g.nodes[v]["y"], g.nodes[v]["x"])
-                # Travel speed ~40 km/h (11.11 m/s)
                 travel_time = dist_m / (40.0 / 3.6)
                 g.add_edge(u, v, travel_time=travel_time, length=dist_m, speed_kph=40.0)
                 g.add_edge(v, u, travel_time=travel_time, length=dist_m, speed_kph=40.0)
@@ -150,7 +144,6 @@ class TestAStarCorrectness:
         avg_astar = astar_expansions_total / num_pairs
         avg_dijkstra = dijkstra_expansions_total / num_pairs
 
-        # A* directed search must prune exploration space compared to Dijkstra
         assert avg_astar < avg_dijkstra, f"Expected A* ({avg_astar}) < Dijkstra ({avg_dijkstra})"
 
 
@@ -169,7 +162,6 @@ class TestAStarEdgeCases:
 
     def test_unreachable_goal(self, grid_network):
         """When goal is unreachable, plan must return ([], inf, stats)."""
-        # Create an isolated disconnected node
         g = grid_network.copy()
         isolated_node = 999
         g.add_node(isolated_node, x=72.99, y=23.99)
@@ -187,3 +179,108 @@ class TestAStarEdgeCases:
         assert path == []
         assert cost == float("inf")
         assert stats["expansions"] == 0
+
+    def test_plan_treats_inf_edges_as_blocked(self, grid_network, grid_heuristic):
+        """Edges with travel_time = inf must be treated as blocked by plan()."""
+        g = grid_network.copy()
+        # Direct edge between 0 and 1
+        g[0][1]["travel_time"] = float("inf")
+
+        path, cost, stats = plan(g, 0, 1, heuristic=grid_heuristic)
+        assert path != [0, 1]
+        assert (0, 1) not in list(zip(path[:-1], path[1:]))
+        assert cost < float("inf")
+
+
+class TestDynamicAStarAgent:
+    """Tests for run_astar_agent dynamic simulation and rerouting."""
+
+    @pytest.fixture
+    def diamond_graph(self) -> nx.DiGraph:
+        """Diamond topology:
+           0 -> 1 -> 3
+           0 -> 2 -> 3
+        """
+        g = nx.DiGraph()
+        g.add_node(0, x=0.0, y=0.0)
+        g.add_node(1, x=1.0, y=1.0)
+        g.add_node(2, x=1.0, y=-1.0)
+        g.add_node(3, x=2.0, y=0.0)
+
+        # Path 0 -> 1 -> 3: cost 10 + 10 = 20 (initially shorter)
+        g.add_edge(0, 1, travel_time=10.0)
+        g.add_edge(1, 3, travel_time=10.0)
+
+        # Path 0 -> 2 -> 3: cost 15 + 15 = 30 (initially longer)
+        g.add_edge(0, 2, travel_time=15.0)
+        g.add_edge(2, 3, travel_time=15.0)
+        return g
+
+    def test_run_astar_agent_static_execution(self, diamond_graph):
+        """Without events, agent takes optimal path with 0 replans."""
+        result = run_astar_agent(diamond_graph, start=0, goal=3, events=[], heuristic=None)
+
+        assert result["status"] == "reached"
+        assert result["path_taken"] == [0, 1, 3]
+        assert result["travel_time"] == 20.0
+        assert result["steps"] == 2
+        assert result["replans"] == 0
+        assert result["replan_latencies_ms"] == []
+        assert result["total_replan_time_ms"] == 0.0
+
+    def test_run_astar_agent_dynamic_closure_rerouting(self, diamond_graph):
+        """Closure of (1, 3) at step 1 forces agent to replan around to 2."""
+        # Vehicle moves 0 -> 1 (t=1).
+        # At t=1, edge (1, 3) is closed!
+        # Add reverse edge 1 -> 0 so it can backtrack to 2
+        diamond_graph.add_edge(1, 0, travel_time=10.0)
+
+        events = [Event(step=1, u=1, v=3, new_cost=float("inf"), kind="closure")]
+
+        result = run_astar_agent(
+            diamond_graph, start=0, goal=3, events=events, heuristic=None, verify=True
+        )
+
+        assert result["status"] == "reached"
+        # 0 -> 1, sees closure, replans 1 -> 0 -> 2 -> 3
+        assert result["path_taken"] == [0, 1, 0, 2, 3]
+        assert result["replans"] == 1
+        assert len(result["replan_latencies_ms"]) == 1
+        assert result["travel_time"] == 10.0 + 10.0 + 15.0 + 15.0  # 50.0
+
+    def test_run_astar_agent_stuck_when_isolated(self, diamond_graph):
+        """When all paths are blocked, agent marks status = 'stuck'."""
+        events = [Event(step=1, u=1, v=3, new_cost=float("inf"), kind="closure")]
+
+        result = run_astar_agent(diamond_graph, start=0, goal=3, events=events, heuristic=None)
+
+        assert result["status"] == "stuck"
+        assert result["path_taken"] == [0, 1]
+        assert result["replans"] == 1
+
+    def test_run_astar_agent_caller_graph_immutability(self, diamond_graph):
+        """Agent must work on graph.copy() and never mutate caller's graph."""
+        orig_cost = diamond_graph[1][3]["travel_time"]
+        events = [Event(step=1, u=1, v=3, new_cost=float("inf"), kind="closure")]
+
+        run_astar_agent(diamond_graph, start=0, goal=3, events=events, heuristic=None)
+
+        # Caller's graph must remain unaltered
+        assert diamond_graph[1][3]["travel_time"] == orig_cost
+
+    def test_run_astar_agent_contract_keys(self, diamond_graph):
+        """Verify the exact required result dictionary keys."""
+        required_keys = {
+            "status",
+            "path_taken",
+            "travel_time",
+            "steps",
+            "replans",
+            "initial_expansions",
+            "replan_expansions",
+            "total_expansions",
+            "replan_latencies_ms",
+            "total_replan_time_ms",
+        }
+        result = run_astar_agent(diamond_graph, start=0, goal=3, events=[], heuristic=None)
+        assert set(result.keys()) == required_keys
