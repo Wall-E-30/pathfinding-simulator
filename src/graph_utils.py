@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Union
 
 import networkx as nx
-import osmnx as ox
+
 
 # Mean Earth radius in metres (WGS 84 / IUGG standard)
 EARTH_RADIUS_M: float = 6_371_000.0
@@ -87,6 +87,7 @@ def load_graph(path: Union[str, Path]) -> nx.MultiDiGraph:
 
     # Load offline GraphML structure (fallback to nx.read_graphml for non-integer node IDs)
     try:
+        import osmnx as ox
         G = ox.load_graphml(file_path)
     except (ValueError, TypeError):
         G = nx.read_graphml(file_path)
@@ -132,11 +133,13 @@ def prepare_graph(G: nx.MultiDiGraph) -> nx.DiGraph:
     # Only impute speeds if edges lack speed_kph
     has_speeds = any("speed_kph" in data for _, _, data in G.edges(data=True))
     if not has_speeds:
+        import osmnx as ox
         G = ox.add_edge_speeds(G, fallback=30.0)
 
     # Only impute travel times if edges lack travel_time
     has_tt = any("travel_time" in data for _, _, data in G.edges(data=True))
     if not has_tt:
+        import osmnx as ox
         G = ox.add_edge_travel_times(G)
 
     # 2. Collapse parallel edges into a DiGraph (keep min travel_time)
