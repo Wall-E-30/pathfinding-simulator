@@ -50,3 +50,27 @@ h(n, goal) = haversine_m(n, goal) / v_max
 - `v_max`: Maximum permissible traversal speed (m/s) across all edges in the graph.
 - Units: Seconds.
 - Guarantee: Admissible and consistent because straight-line distance divided by the network's maximum theoretical speed never overestimates the true travel time.
+
+
+---
+
+## Interactive Streamlit Web Application
+
+An interactive web interface is provided in `app/app.py` for map visualization and simulation inspection.
+
+### Running Locally
+To run the Streamlit application:
+```bash
+streamlit run app/app.py
+```
+
+### Deployment on Streamlit Community Cloud
+1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
+2. Click **Create app** and select the repository: `Wall-E-30/pathfinding-simulator`.
+3. Set **Main file path** to:
+   ```text
+   app/app.py
+   ```
+4. Under **Advanced settings**, set the **Python version** to **3.11** or **3.12**.
+5. Click **Deploy!**
+   - The deployment will use `app/requirements.txt` which contains only lightweight packages (`streamlit`, `folium`, `streamlit-folium`, `networkx`, `numpy`), completely avoiding heavy GIS compilation issues.
