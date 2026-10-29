@@ -145,3 +145,4 @@ class TestBenchmarkHelpers:
 
         # Travel time difference count (Seed 2 diff = 5.0 > 1e-6)
         assert summary["travel_time_diff_count"] == 1
+
