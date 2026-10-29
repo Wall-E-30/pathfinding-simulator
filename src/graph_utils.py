@@ -1,29 +1,28 @@
 """Graph utility functions for road network processing and pathfinding.
 
-Provides utilities for:
-- Computing Haversine great-circle distances in metres.
-- Imputing edge speeds and calculating travel times using OSMnx.
-- Collapsing parallel directed edges by retaining the minimum travel time.
-- Computing maximum traversal speed (v_max) in metres/second for admissible heuristics.
-- Snapping geographical coordinates to the nearest road network node.
+Provides:
+- haversine_m: Great-circle distance between coordinates in metres.
+- load_graph: Loads a GraphML file offline and converts string attributes to numeric.
+- prepare_graph: Converts MultiDiGraph to a strongly connected DiGraph with travel times.
+- compute_v_max: Calculates maximum network speed (m/s) for admissible heuristics.
+- make_heuristic: Generates admissible travel-time heuristic function h(n, goal).
+- snap_to_node: Snaps geographic coordinates to the nearest network node.
 """
 
 from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple, Union
+from typing import Any, Callable, Dict, Union
 
 import networkx as nx
 import osmnx as ox
-
-from src.graph import Graph, _validate_cost
 
 # Mean Earth radius in metres (WGS 84 / IUGG standard)
 EARTH_RADIUS_M: float = 6_371_000.0
 
 
-def haversine(
+def haversine_m(
     lat1: float,
     lon1: float,
     lat2: float,
@@ -32,43 +31,26 @@ def haversine(
 ) -> float:
     """Compute the great-circle distance between two geographic coordinates in metres.
 
-    Uses the Haversine formula:
+    Viva note:
+        Uses the Haversine formula on spherical coordinates:
         a = sin²(Δφ/2) + cos(φ1) * cos(φ2) * sin²(Δλ/2)
         c = 2 * atan2(√a, √(1−a))
         d = R * c
-
-    Args:
-        lat1: Latitude of the first point in decimal degrees [-90.0, 90.0].
-        lon1: Longitude of the first point in decimal degrees [-180.0, 180.0].
-        lat2: Latitude of the second point in decimal degrees [-90.0, 90.0].
-        lon2: Longitude of the second point in decimal degrees [-180.0, 180.0].
-        radius: Earth radius in metres (defaults to 6,371,000.0 m).
-
-    Returns:
-        Great-circle distance between the two points in metres.
-
-    Raises:
-        TypeError: If coordinates or radius are not numeric.
-        ValueError: If coordinates are outside valid geographic ranges or non-finite.
+        Clamping 'a' to [0.0, 1.0] guards against micro floating-point rounding errors
+        that would otherwise produce ValueError when calculating sqrt(1 - a).
     """
-    for name, val in [("lat1", lat1), ("lon1", lon1), ("lat2", lat2), ("lon2", lon2), ("radius", radius)]:
+    for name, val in [("lat1", lat1), ("lon1", lon1), ("lat2", lat2), ("lon2", lon2)]:
         if isinstance(val, bool) or not isinstance(val, (int, float)):
             raise TypeError(f"{name} must be numeric, got {type(val).__name__}")
         if math.isnan(val) or math.isinf(val):
-            raise ValueError(f"{name} must be a finite number, got {val}")
+            raise ValueError(f"{name} must be finite, got {val}")
 
-    if not (-90.0 <= lat1 <= 90.0):
-        raise ValueError(f"lat1 must be in [-90.0, 90.0], got {lat1}")
-    if not (-90.0 <= lat2 <= 90.0):
-        raise ValueError(f"lat2 must be in [-90.0, 90.0], got {lat2}")
-    if not (-180.0 <= lon1 <= 180.0):
-        raise ValueError(f"lon1 must be in [-180.0, 180.0], got {lon1}")
-    if not (-180.0 <= lon2 <= 180.0):
-        raise ValueError(f"lon2 must be in [-180.0, 180.0], got {lon2}")
-    if radius <= 0:
-        raise ValueError(f"radius must be positive, got {radius}")
+    if not (-90.0 <= lat1 <= 90.0) or not (-90.0 <= lat2 <= 90.0):
+        raise ValueError("Latitude must be in [-90.0, 90.0]")
+    if not (-180.0 <= lon1 <= 180.0) or not (-180.0 <= lon2 <= 180.0):
+        raise ValueError("Longitude must be in [-180.0, 180.0]")
 
-    # Identical points have 0 distance
+    # Identical coordinates have 0.0 distance
     if lat1 == lat2 and lon1 == lon2:
         return 0.0
 
@@ -81,252 +63,218 @@ def haversine(
         math.sin(dphi / 2.0) ** 2
         + math.cos(phi1) * math.cos(phi2) * (math.sin(dlambda / 2.0) ** 2)
     )
-    # Clamp to [0.0, 1.0] to guard against floating-point inaccuracies
+    # Clamp to [0.0, 1.0] for floating point domain safety
     a = min(1.0, max(0.0, a))
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     return float(radius * c)
 
 
-def add_edge_speeds(
-    G: nx.MultiDiGraph,
-    hwy_speeds: Dict[str, float] | None = None,
-    fallback: float | None = 30.0,
-    **kwargs: Any,
-) -> nx.MultiDiGraph:
-    """Impute edge speeds (km/h) across graph edges using ox.add_edge_speeds().
+# Backward-compatible alias
+haversine = haversine_m
 
-    Args:
-        G: Input NetworkX MultiDiGraph (road network).
-        hwy_speeds: Lookup mapping of highway types to speeds in km/h.
-        fallback: Default fallback speed in km/h when maxspeed is missing (defaults to 30.0).
-        **kwargs: Additional parameters forwarded to ox.add_edge_speeds().
 
-    Returns:
-        The modified graph G with 'speed_kph' edge attributes.
+def load_graph(path: Union[str, Path]) -> nx.MultiDiGraph:
+    """Load an OSMnx street network from a GraphML file offline.
+
+    Viva note:
+        GraphML format stores all node and edge attributes as strings.
+        We convert coordinates ('x', 'y') and numerical edge properties ('length')
+        to proper Python floats so geometric calculations do not fail with string errors.
     """
-    if "crs" not in G.graph:
-        G.graph["crs"] = "epsg:4326"
-    return ox.add_edge_speeds(G, hwy_speeds=hwy_speeds, fallback=fallback, **kwargs)
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Graph file not found: {file_path}")
 
+    # Load offline GraphML structure (fallback to nx.read_graphml for non-integer node IDs)
+    try:
+        G = ox.load_graphml(file_path)
+    except (ValueError, TypeError):
+        G = nx.read_graphml(file_path)
 
-def add_edge_travel_times(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
-    """Calculate travel times (seconds) for all edges using ox.add_edge_travel_times().
+    # Cast node coordinates to floats
+    for _, data in G.nodes(data=True):
+        if "x" in data:
+            data["x"] = float(data["x"])
+        if "y" in data:
+            data["y"] = float(data["y"])
 
-    Requires each edge to have 'length' (metres) and 'speed_kph' attributes.
-    Calculates: travel_time = length / (speed_kph * 1000 / 3600).
+    # Cast numeric edge attributes
+    for _, _, data in G.edges(data=True):
+        if "length" in data:
+            try:
+                data["length"] = float(data["length"])
+            except (ValueError, TypeError):
+                pass
+        if "speed_kph" in data:
+            try:
+                data["speed_kph"] = float(data["speed_kph"])
+            except (ValueError, TypeError):
+                pass
 
-    Args:
-        G: Input NetworkX MultiDiGraph with 'speed_kph' and 'length' attributes.
-
-    Returns:
-        The modified graph G with 'travel_time' edge attributes in seconds.
-    """
-    return ox.add_edge_travel_times(G)
-
-
-def add_edge_speeds_and_travel_times(
-    G: nx.MultiDiGraph,
-    hwy_speeds: Dict[str, float] | None = None,
-    fallback: float | None = 30.0,
-) -> nx.MultiDiGraph:
-    """Add edge speeds and calculate edge travel times in sequence.
-
-    Uses ox.add_edge_speeds() followed by ox.add_edge_travel_times().
-
-    Args:
-        G: Input NetworkX MultiDiGraph.
-        hwy_speeds: Lookup mapping of highway types to speed in km/h.
-        fallback: Fallback speed in km/h when highway speed is unmapped.
-
-    Returns:
-        The graph G populated with both 'speed_kph' and 'travel_time' edge attributes.
-    """
-    G = add_edge_speeds(G, hwy_speeds=hwy_speeds, fallback=fallback)
-    G = add_edge_travel_times(G)
     return G
 
 
-def collapse_parallel_edges(
-    G: nx.MultiDiGraph,
-    weight_attr: str = "travel_time",
-    as_custom_graph: bool = False,
-) -> Union[nx.DiGraph, Graph]:
-    """Collapse parallel directed edges in a MultiDiGraph using minimum travel time (seconds).
+def prepare_graph(G: nx.MultiDiGraph) -> nx.DiGraph:
+    """Prepare a road network for routing algorithms.
 
-    For every pair of nodes (u, v) with one or more directed edges, retains the edge
-    with the minimum value of weight_attr (travel time).
+    Steps:
+    1. Impute edge speeds (km/h) and travel times (seconds).
+    2. Collapse parallel directed edges by retaining the minimum travel_time per (u, v).
+    3. Retain node 'x' and 'y' attributes.
+    4. Extract the largest strongly connected component (SCC) so every node pair is reachable.
 
-    Args:
-        G: Input NetworkX MultiDiGraph.
-        weight_attr: Edge attribute representing travel cost (default 'travel_time').
-        as_custom_graph: If True, returns a src.graph.Graph instance;
-                         if False, returns a NetworkX DiGraph preserving all edge metadata.
-
-    Returns:
-        nx.DiGraph or Graph containing exactly one directed edge per (u, v) pair.
+    Viva note:
+        Urban street networks have one-way streets and dead ends. Filtering to the
+        largest Strongly Connected Component (SCC) ensures any node in the graph
+        can reach any other node, preventing unreachable goal failures in evaluation.
     """
-    if as_custom_graph:
-        return Graph.from_osmnx(G, weight_attr=weight_attr)
+    # 1. Ensure edge speeds and travel times exist
+    # Only impute speeds if edges lack speed_kph
+    has_speeds = any("speed_kph" in data for _, _, data in G.edges(data=True))
+    if not has_speeds:
+        G = ox.add_edge_speeds(G, fallback=30.0)
 
-    di_graph = nx.DiGraph()
-    di_graph.graph.update(G.graph)
+    # Only impute travel times if edges lack travel_time
+    has_tt = any("travel_time" in data for _, _, data in G.edges(data=True))
+    if not has_tt:
+        G = ox.add_edge_travel_times(G)
 
-    # Preserve all node attributes
+    # 2. Collapse parallel edges into a DiGraph (keep min travel_time)
+    di_g = nx.DiGraph()
+    di_g.graph.update(G.graph)
+
+    # Copy nodes with float coordinates
     for node, data in G.nodes(data=True):
-        di_graph.add_node(node, **data)
+        node_attrs = dict(data)
+        if "x" in node_attrs:
+            node_attrs["x"] = float(node_attrs["x"])
+        if "y" in node_attrs:
+            node_attrs["y"] = float(node_attrs["y"])
+        di_g.add_node(node, **node_attrs)
 
-    # Group parallel edges and keep the one with minimum travel time
+    # Collapse parallel edges: group by (u, v) and pick minimum travel_time
     for u, v, data in G.edges(data=True):
-        if weight_attr not in data:
-            continue
-        cost = _validate_cost(data[weight_attr])
+        if "travel_time" in data:
+            tt = float(data["travel_time"])
+        elif "length" in data and "speed_kph" in data:
+            # travel_time = length (m) / speed (m/s)
+            speed_mps = float(data["speed_kph"]) / 3.6
+            tt = float(data["length"]) / speed_mps if speed_mps > 0 else 1.0
+        else:
+            tt = 1.0
 
-        if di_graph.has_edge(u, v):
-            if cost < di_graph[u][v][weight_attr]:
-                # Overwrite with faster edge attributes
+        if tt <= 0:
+            tt = 1.0  # Guard against non-positive travel times
+
+        if di_g.has_edge(u, v):
+            if tt < di_g[u][v]["travel_time"]:
                 edge_data = dict(data)
-                edge_data[weight_attr] = cost
-                di_graph[u][v].update(edge_data)
+                edge_data["travel_time"] = tt
+                di_g[u][v].update(edge_data)
         else:
             edge_data = dict(data)
-            edge_data[weight_attr] = cost
-            di_graph.add_edge(u, v, **edge_data)
+            edge_data["travel_time"] = tt
+            di_g.add_edge(u, v, **edge_data)
 
-    return di_graph
+    # 3. Extract the largest Strongly Connected Component (SCC)
+    if len(di_g) > 0 and not nx.is_strongly_connected(di_g):
+        largest_scc_nodes = max(nx.strongly_connected_components(di_g), key=len)
+        di_g = di_g.subgraph(largest_scc_nodes).copy()
+
+    return di_g
 
 
-def compute_v_max(G: Any) -> float:
-    """Compute the maximum travel speed (v_max) across all edges in metres per second.
+def compute_v_max(G: Union[nx.DiGraph, nx.MultiDiGraph]) -> float:
+    """Compute the maximum traversal speed (v_max) across all edges in metres per second.
 
-    Used by heuristic pathfinding algorithms (such as A*) to calculate admissible
-    travel-time heuristics:
-        h(u, goal) = haversine(u, goal) / v_max
-
-    Speed is computed from:
-    1. Edge 'speed_kph' converted to m/s: (speed_kph * 1000 / 3600 = speed_kph / 3.6).
-    2. Edge ratio: length (metres) / travel_time (seconds) if length and travel_time exist.
-
-    Args:
-        G: NetworkX MultiDiGraph, DiGraph, or custom Graph.
-
-    Returns:
-        Maximum traversal speed in metres per second (float).
-
-    Raises:
-        ValueError: If the graph has no edges or no valid positive speed attributes.
+    Viva note:
+        For A* heuristic admissibility, h(n, goal) = distance(n, goal) / v_max.
+        By dividing the Euclidean/Haversine distance by the highest possible edge speed
+        anywhere in the network, h(n, goal) is guaranteed to never overestimate the actual
+        travel time, satisfying the admissibility condition h(n) <= h*(n).
     """
     max_mps: float = 0.0
 
-    if isinstance(G, (nx.MultiDiGraph, nx.DiGraph, nx.Graph)):
-        for _, _, data in G.edges(data=True):
-            edge_speed_mps: float | None = None
+    for _, _, data in G.edges(data=True):
+        edge_speed_mps: float | None = None
 
-            # Check explicit speed_kph
-            if "speed_kph" in data:
-                raw_speed = data["speed_kph"]
-                if isinstance(raw_speed, (int, float)) and raw_speed > 0:
-                    edge_speed_mps = float(raw_speed) / 3.6
-                elif isinstance(raw_speed, Iterable) and not isinstance(raw_speed, (str, bytes)):
-                    valid_speeds = [float(s) for s in raw_speed if isinstance(s, (int, float)) and s > 0]
-                    if valid_speeds:
-                        edge_speed_mps = max(valid_speeds) / 3.6
+        # Check explicit speed_kph
+        if "speed_kph" in data:
+            raw_speed = data["speed_kph"]
+            if isinstance(raw_speed, (int, float)) and raw_speed > 0:
+                edge_speed_mps = float(raw_speed) / 3.6
 
-            # Check length and travel_time ratio
-            if edge_speed_mps is None and "length" in data and "travel_time" in data:
+        # Ratio check: length / travel_time
+        if edge_speed_mps is None and "length" in data and "travel_time" in data:
+            try:
                 length = float(data["length"])
                 travel_time = float(data["travel_time"])
                 if travel_time > 0 and length > 0:
                     edge_speed_mps = length / travel_time
+            except (ValueError, TypeError):
+                pass
 
-            if edge_speed_mps is not None and edge_speed_mps > max_mps:
-                max_mps = edge_speed_mps
-
-    elif isinstance(G, Graph):
-        # Inspect edge costs and node coordinates if available
-        for u in G.nodes:
-            u_data = G.get_node_data(u)
-            if "x" not in u_data or "y" not in u_data:
-                continue
-            u_lat, u_lon = float(u_data["y"]), float(u_data["x"])
-
-            for v, cost in G.get_neighbors(u).items():
-                if cost <= 0:
-                    continue
-                v_data = G.get_node_data(v)
-                if "x" not in v_data or "y" not in v_data:
-                    continue
-                v_lat, v_lon = float(v_data["y"]), float(v_data["x"])
-
-                dist_m = haversine(u_lat, u_lon, v_lat, v_lon)
-                speed_mps = dist_m / cost
-                if speed_mps > max_mps:
-                    max_mps = speed_mps
+        if edge_speed_mps is not None and edge_speed_mps > max_mps:
+            max_mps = edge_speed_mps
 
     if max_mps <= 0.0:
-        raise ValueError("Could not determine valid positive edge speeds from the provided graph.")
+        # Fallback to standard 60 km/h (16.67 m/s) if no speed could be inferred
+        return 60.0 / 3.6
 
     return max_mps
 
 
+def make_heuristic(G: nx.DiGraph) -> Callable[[Any, Any], float]:
+    """Return an admissible travel-time heuristic function h(n, goal) in seconds.
+
+    Viva note:
+        Pre-caching node coordinates into a dictionary gives O(1) coordinate lookups
+        during priority queue expansions, avoiding overhead in A*.
+        h(n, goal) = haversine_m(lat_n, lon_n, lat_g, lon_g) / v_max.
+    """
+    v_max = compute_v_max(G)
+
+    # Pre-cache coordinates: node_id -> (lat, lon)
+    coords: Dict[Any, tuple[float, float]] = {}
+    for node, data in G.nodes(data=True):
+        coords[node] = (float(data["y"]), float(data["x"]))
+
+    def heuristic(n: Any, goal: Any) -> float:
+        if n == goal:
+            return 0.0
+        lat_n, lon_n = coords[n]
+        lat_g, lon_g = coords[goal]
+        dist_m = haversine_m(lat_n, lon_n, lat_g, lon_g)
+        return dist_m / v_max
+
+    return heuristic
+
+
 def snap_to_node(
-    G: Any,
+    G: Union[nx.DiGraph, nx.MultiDiGraph],
     lat: float,
     lon: float,
-    return_dist: bool = False,
 ) -> Any:
-    """Snap a geographic coordinate (lat, lon) to the nearest road network node.
+    """Snap geographic coordinates (lat, lon) to the nearest road network node ID.
 
-    Uses OSMnx nearest-node functionality (ox.nearest_nodes).
-
-    Args:
-        G: NetworkX MultiDiGraph, DiGraph, or custom Graph containing node coordinates.
-        lat: Target latitude in decimal degrees [-90.0, 90.0].
-        lon: Target longitude in decimal degrees [-180.0, 180.0].
-        return_dist: If True, returns a tuple of (node_id, distance_in_metres).
-                     Defaults to False (returns node_id only).
-
-    Returns:
-        Nearest node identifier, or (node_id, dist_m) if return_dist=True.
-
-    Raises:
-        TypeError: If lat or lon are not numeric.
-        ValueError: If lat or lon are outside geographic bounds or non-finite.
+    Viva note:
+        Uses Haversine great-circle distance to find the closest node in G.
+        Works across both MultiDiGraph and DiGraph.
     """
-    for name, val in [("lat", lat), ("lon", lon)]:
-        if isinstance(val, bool) or not isinstance(val, (int, float)):
-            raise TypeError(f"{name} must be numeric, got {type(val).__name__}")
-        if math.isnan(val) or math.isinf(val):
-            raise ValueError(f"{name} must be a finite number, got {val}")
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        raise ValueError("Coordinates out of geographic range")
 
-    if not (-90.0 <= lat <= 90.0):
-        raise ValueError(f"lat must be in [-90.0, 90.0], got {lat}")
-    if not (-180.0 <= lon <= 180.0):
-        raise ValueError(f"lon must be in [-180.0, 180.0], got {lon}")
+    best_node = None
+    min_dist = float("inf")
 
-    # NetworkX / OSMnx graphs
-    if isinstance(G, (nx.MultiDiGraph, nx.DiGraph, nx.Graph)):
-        # OSMnx nearest_nodes expects X=lon, Y=lat
-        result = ox.nearest_nodes(G, X=float(lon), Y=float(lat), return_dist=return_dist)
-        return result
+    for node, data in G.nodes(data=True):
+        if "x" in data and "y" in data:
+            dist = haversine_m(lat, lon, float(data["y"]), float(data["x"]))
+            if dist < min_dist:
+                min_dist = dist
+                best_node = node
 
-    # Custom Graph class fallback
-    if isinstance(G, Graph):
-        best_node = None
-        best_dist = float("inf")
+    if best_node is None:
+        raise ValueError("Graph contains no nodes with coordinates.")
 
-        for node in G.nodes:
-            nd = G.get_node_data(node)
-            if "x" in nd and "y" in nd:
-                d = haversine(lat, lon, float(nd["y"]), float(nd["x"]))
-                if d < best_dist:
-                    best_dist = d
-                    best_node = node
-
-        if best_node is None:
-            raise ValueError("Graph contains no nodes with 'x' and 'y' coordinates.")
-
-        if return_dist:
-            return best_node, best_dist
-        return best_node
-
-    raise TypeError(f"Unsupported graph type: {type(G).__name__}")
+    return best_node

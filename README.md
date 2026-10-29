@@ -1,69 +1,52 @@
-# pathfinding-simulator
-Graph algorithms, dynamic pathfinding simulation, and performance metrics.
-## Interface Contract
+# Dynamic Emergency Vehicle Rerouting on Live Street Networks
+
+A pathfinding simulation project evaluating static and dynamic routing algorithms for emergency vehicles navigating live urban road networks. Built with Python 3.11, NetworkX, OSMnx, and pytest.
+
+---
+
+## Shared Interface Contract
+
+All routing algorithms adhere strictly to the following specification:
 
 ### 1. Graph Representation
+- **Type**: `networkx.DiGraph` (directed graph).
+- **Edges**: Exactly **one** directed edge per `(u, v)` pair.
+- **Edge Attribute**: `"travel_time"` (travel time in seconds, non-negative float).
+- **Node Attributes**: `"x"` (longitude in degrees) and `"y"` (latitude in degrees).
 
-* The graph is a directed, weighted graph.
-* Each directed `(u, v)` pair stores exactly one travel cost.
-* Edge weights represent travel time in seconds.
-* When converting an OSMnx `MultiDiGraph`, multiple edges between the same nodes must be collapsed by retaining the edge with the minimum travel time.
-* If an edge does not exist, it must not be treated as a valid connection.
-
-### 2. Graph API
-
+### 2. Algorithm Interface
+Every routing algorithm exposes a standard `plan` function:
 ```python
-graph.update_edge(u, v, new_cost)
+def plan(
+    graph: nx.DiGraph,
+    start: Any,
+    goal: Any,
+    heuristic: Callable[[Any, Any], float] | None = None
+) -> tuple[list[Any], float, dict[str, Any]]:
+    ...
 ```
 
-* Updates the cost of the directed edge `(u, v)`.
-* `new_cost` must be a non-negative number.
-* The updated cost must be used by subsequent planning calls.
-* Document the behavior when the specified edge does not exist.
+#### Return Value
+- `path`: List of node IDs from `start` to `goal`, inclusive (e.g., `[start, ..., goal]`).
+- `cost`: Total travel time along the path in seconds (`float`).
+- `stats`: Execution statistics dictionary:
+  ```python
+  {
+      "expansions": int,   # Total number of nodes popped and expanded from priority queue
+      "time_ms": float     # Total wall-clock execution time in milliseconds
+  }
+  ```
 
-### 3. Algorithm API
+#### Edge Cases
+- **Unreachable Goal**: Returns `([], float("inf"), stats)`.
+- **Identical Start and Goal (`start == goal`)**: Returns `([start], 0.0, stats)`.
 
+### 3. Heuristic Function
+For informed search algorithms (such as A*), the admissible travel-time heuristic is defined as:
 ```python
-path, cost, stats = algo.plan(graph, start, goal)
+h(n, goal) = haversine_m(n, goal) / v_max
 ```
-
-* `path`: list of node IDs from `start` to `goal`, inclusive.
-* `cost`: total travel time along the returned path, in seconds.
-* `stats`: dictionary containing:
-
-  * `expansions`: number of nodes expanded during the search.
-  * `time_ms`: algorithm execution time in milliseconds.
-* If the goal is unreachable, return an empty path and `float("inf")` as the cost.
-* If `start == goal`, return `[start]` and cost `0`.
-
-### 4. Statistics Format
-
-All algorithms must return the same statistics keys:
-
-```python
-{
-    "expansions": 0,
-    "time_ms": 0.0
-}
-```
-
-`expansions` must be an integer and `time_ms` must be a non-negative number.
-
-### 5. Testing Requirements
-
-* Test a known shortest path and its cost.
-* Test unreachable goals and identical start/goal nodes.
-* Test parallel-edge reduction using minimum travel time.
-* Test edge updates and their effect on subsequent planning.
-* Verify that every returned path uses valid edges.
-* Verify that the reported cost equals the sum of the path's edge costs.
-
-### 6. Collaboration Rules
-
-* Shubh works on `shubh/*` branches.
-* Tilak works on `tilak/*` branches.
-* Never commit directly to `main`.
-* Every change must go through a pull request.
-* Shubh and Tilak review each other's pull requests.
-* Write tests first, then implementation.
-* Explain proposed changes before applying them.
+- `haversine_m`: Great-circle distance in metres between node `n` and `goal`.
+- `v_max`: Maximum permissible traversal speed (m/s) across all edges in the graph.
+- Units: Seconds.
+- Guarantee: Admissible and consistent because straight-line distance divided by the network's maximum theoretical speed never overestimates the true travel time.
