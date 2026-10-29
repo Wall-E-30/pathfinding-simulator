@@ -10,9 +10,11 @@ from src.graph_utils import (
     prepare_graph,
     snap_to_node,
 )
+from src.grid import create_grid_graph
 
 __all__ = [
     "Graph",
+    "create_grid_graph",
     "plan",
     "compute_v_max",
     "haversine_m",
