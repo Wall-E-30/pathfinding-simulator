@@ -54,6 +54,9 @@ class DStarLite:
         # km: Accumulated key modifier accounting for robot movement (0 in initial planning)
         self.km: float = 0.0
 
+        # s_last: Vehicle position where km was last updated (Koenig & Likhachev 2002)
+        self.s_last: Node = start
+
         # Performance metric: number of vertex expansions
         self.expansions: int = 0
 
@@ -110,7 +113,7 @@ class DStarLite:
             # Avoid inf + h arithmetic and prevent NaN comparisons
             return (float("inf"), float("inf"))
 
-        # h(s_start, s): estimated cost from start to s in backward search
+        # h(s_start, s): estimated cost from current vehicle position start to s
         h_val = self.heuristic(self.start, s) if self.heuristic else 0.0
         return (m + h_val + self.km, m)
 
@@ -122,6 +125,7 @@ class DStarLite:
         self._heap.clear()
         self._open_set.clear()
         self.km = 0.0
+        self.s_last = self.start
         self.expansions = 0
 
         # Goal is the destination of the backward search, so rhs(goal) = 0
@@ -141,6 +145,7 @@ class DStarLite:
             succs = list(self.graph.successors(u))
             if succs:
                 # Find minimum one-step lookahead cost to goal through any outgoing edge
+                # If an edge is closed (travel_time == inf), edge_cost + g is inf
                 self.rhs[u] = min(
                     self.graph[u][s]["travel_time"] + self.g[s]
                     for s in succs
@@ -198,6 +203,83 @@ class DStarLite:
                 for p in list(self.graph.predecessors(u)) + [u]:
                     self.update_vertex(p)
 
+    def move_start(self, new_start: Node) -> None:
+        """Update vehicle position, accumulating distance traveled into km modifier.
+
+        Paper: Line {28} km = km + h(s_last, s_start); s_last = s_start
+        Accumulates travel distance into km so keys in the priority queue
+        remain valid lower bounds without needing to re-key all entries.
+        """
+        if self.heuristic is not None:
+            h_dist = self.heuristic(self.s_last, new_start)
+            # Never subtract infinities; only accumulate finite heuristic lower bounds
+            if h_dist != float("inf"):
+                self.km += h_dist
+        self.s_last = new_start
+        self.start = new_start
+
+    def notify_changes(self, changes: List[Tuple[Node, Node, float, float]]) -> int:
+        """Notify planner of edge cost updates and repair shortest paths.
+
+        Args:
+            changes: List of (u, v, old_cost, new_cost) where the graph has
+                ALREADY been mutated in place.
+
+        Returns:
+            Number of vertex expansions performed by this replanning call only.
+
+        Note on Paper Correspondence:
+            This is the simplified form of Koenig & Likhachev (2002) line {24}:
+            for each unique tail node u of a changed directed edge (u, v),
+            we recompute rhs(u) from its successors by calling update_vertex(u).
+            The paper's version also compares old_cost vs new_cost to skip
+            redundant updates, but calling update_vertex(u) guarantees identical
+            correctness with zero duplicated logic.
+        """
+        expansions_before = self.expansions
+
+        # For each unique tail node u, update its one-step lookahead rhs(u)
+        unique_tails = dict.fromkeys(u for u, v, old_cost, new_cost in changes)
+        for u in unique_tails:
+            self.update_vertex(u)
+
+        # Propagate changes through the search tree
+        self.compute_shortest_path()
+
+        return self.expansions - expansions_before
+
+    def next_step(self) -> Node | None:
+        """Return the optimal next successor to move to from current start.
+
+        Finds: argmin_{s' in Succ(start)} (cost(start, s') + g[s']) over finite edges.
+        Returns None if start is at the goal or if the goal is unreachable.
+        """
+        if self.start == self.goal:
+            return None
+
+        if self.g[self.start] == float("inf"):
+            return None
+
+        best_succ = None
+        best_cost = float("inf")
+
+        for s in self.graph.successors(self.start):
+            edge_cost = float(self.graph[self.start][s]["travel_time"])
+            # Invariant: Inf edges are blocked; impassable successors skipped
+            if edge_cost == float("inf") or self.g[s] == float("inf"):
+                continue
+            total = edge_cost + self.g[s]
+            if total < best_cost:
+                best_cost = total
+                best_succ = s
+
+        return best_succ
+
+    @property
+    def cost_to_goal(self) -> float:
+        """Return shortest path cost from current start to goal (g[start])."""
+        return float(self.g[self.start])
+
     def extract_path(self) -> Tuple[List[Node], float]:
         """Greedily extract the shortest path from start to goal following optimal successors.
 
@@ -232,6 +314,9 @@ class DStarLite:
 
             for s in succs:
                 edge_cost = float(self.graph[curr][s]["travel_time"])
+                # Closed edge or unreachable successor
+                if edge_cost == float("inf") or self.g[s] == float("inf"):
+                    continue
                 val = edge_cost + self.g[s]
                 if val < best_val:
                     best_val = val
@@ -296,4 +381,3 @@ def plan(
     stats = {"expansions": planner.expansions, "time_ms": elapsed_ms}
 
     return path, cost, stats
-

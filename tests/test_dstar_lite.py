@@ -1,4 +1,4 @@
-"""Unit tests for D* Lite algorithm (initial planning phase)."""
+"""Unit tests for D* Lite algorithm (initial planning and dynamic edge changes)."""
 
 from __future__ import annotations
 
@@ -189,3 +189,220 @@ class TestDStarLiteInitialPlanning:
                 raise
 
 
+class TestDStarLiteEdgeChanges:
+    """Tests for dynamic edge updates, vehicle movement, and replanning in D* Lite."""
+
+    def test_weighted_15x15_raise_edge_cost_matches_dijkstra(self):
+        """1. Weighted 15x15 grid: raise the cost of one edge on the current path,
+
+        call notify_changes, and the new cost_to_goal equals a fresh Dijkstra.
+        """
+        graph = make_grid(n=15)
+        rng = random.Random(42)
+        for u, v in graph.edges():
+            graph[u][v]["travel_time"] = rng.uniform(1.0, 5.0)
+
+        start = (0, 0)
+        goal = (14, 14)
+        planner = DStarLite(graph, start, goal, heuristic=manhattan)
+        planner.initialize()
+        planner.compute_shortest_path()
+
+        initial_path, initial_cost = planner.extract_path()
+        assert len(initial_path) >= 3
+
+        # Select an edge on the current path and increase its cost substantially
+        u, v = initial_path[1], initial_path[2]
+        old_cost = graph[u][v]["travel_time"]
+        new_cost = old_cost + 50.0
+        graph[u][v]["travel_time"] = new_cost
+
+        # Notify planner of edge change
+        expansions = planner.notify_changes([(u, v, old_cost, new_cost)])
+        assert isinstance(expansions, int)
+        assert expansions >= 0
+
+        # Fresh Dijkstra verification
+        expected_cost = nx.shortest_path_length(
+            graph, planner.start, planner.goal, weight="travel_time"
+        )
+        assert math.isclose(planner.cost_to_goal, expected_cost, rel_tol=1e-6, abs_tol=1e-6)
+
+    def test_200_seeded_scenarios_cost_increases_and_closures(self):
+        """2. 200 seeded scenarios on weighted random grids with walls:
+
+        move vehicle 0 to 5 steps, apply cost increases and closures (inf),
+        call notify_changes, and compare cost_to_goal with networkx Dijkstra.
+        """
+        for seed in range(200):
+            try:
+                graph = random_grid_with_walls(seed=seed, n=10)
+                rng = random.Random(seed)
+
+                for u, v in graph.edges():
+                    graph[u][v]["travel_time"] = rng.uniform(1.0, 5.0)
+
+                components = [
+                    c for c in nx.connected_components(graph.to_undirected())
+                    if len(c) >= 3
+                ]
+                if not components:
+                    continue
+
+                largest_comp = sorted(max(components, key=len))
+                start, goal = rng.sample(largest_comp, 2)
+
+                planner = DStarLite(graph, start, goal, heuristic=manhattan)
+                planner.initialize()
+                planner.compute_shortest_path()
+
+                # Move vehicle 0 to 5 steps
+                num_moves = rng.randint(0, 5)
+                for _ in range(num_moves):
+                    if planner.start == planner.goal:
+                        break
+                    nxt = planner.next_step()
+                    if nxt is None:
+                        break
+                    planner.move_start(nxt)
+
+                # Apply random cost increases and closures (inf) to 1 to 4 edges
+                all_edges = list(graph.edges())
+                sampled_edges = rng.sample(all_edges, min(len(all_edges), rng.randint(1, 4)))
+                changes = []
+
+                for u, v in sampled_edges:
+                    old_cost = graph[u][v]["travel_time"]
+                    if rng.random() < 0.3:
+                        new_cost = float("inf")
+                    else:
+                        new_cost = old_cost * rng.uniform(1.5, 4.0)
+                    graph[u][v]["travel_time"] = new_cost
+                    changes.append((u, v, old_cost, new_cost))
+
+                planner.notify_changes(changes)
+
+                # Ground truth: Dijkstra on graph copy with inf edges removed
+                h_graph = graph.copy()
+                inf_edges = [
+                    (u, v) for u, v, d in h_graph.edges(data=True)
+                    if d.get("travel_time") == float("inf")
+                ]
+                h_graph.remove_edges_from(inf_edges)
+
+                if nx.has_path(h_graph, planner.start, planner.goal):
+                    expected = nx.shortest_path_length(
+                        h_graph, planner.start, planner.goal, weight="travel_time"
+                    )
+                    assert math.isclose(planner.cost_to_goal, expected, rel_tol=1e-5, abs_tol=1e-5), (
+                        f"Cost mismatch on seed {seed}: dstar={planner.cost_to_goal}, dijkstra={expected}"
+                    )
+                    assert planner.next_step() is not None or planner.start == planner.goal
+                else:
+                    assert planner.cost_to_goal == float("inf"), (
+                        f"Expected inf on seed {seed}, got {planner.cost_to_goal}"
+                    )
+                    assert planner.next_step() is None
+            except Exception:
+                print(f"Failed on seed {seed}")
+                raise
+
+    def test_200_seeded_scenarios_cost_decreases_with_zero_heuristic(self):
+        """3. Same as test 2 but with cost DECREASES allowed (down to 0.5),
+
+        using zero heuristic (lambda n, g: 0.0) since decreases break Manhattan admissibility.
+        """
+        for seed in range(200):
+            try:
+                graph = random_grid_with_walls(seed=seed, n=10)
+                rng = random.Random(seed)
+
+                for u, v in graph.edges():
+                    graph[u][v]["travel_time"] = rng.uniform(1.0, 5.0)
+
+                components = [
+                    c for c in nx.connected_components(graph.to_undirected())
+                    if len(c) >= 3
+                ]
+                if not components:
+                    continue
+
+                largest_comp = sorted(max(components, key=len))
+                start, goal = rng.sample(largest_comp, 2)
+
+                # Zero heuristic handles arbitrary edge cost decreases
+                planner = DStarLite(graph, start, goal, heuristic=lambda n, g: 0.0)
+                planner.initialize()
+                planner.compute_shortest_path()
+
+                num_moves = rng.randint(0, 5)
+                for _ in range(num_moves):
+                    if planner.start == planner.goal:
+                        break
+                    nxt = planner.next_step()
+                    if nxt is None:
+                        break
+                    planner.move_start(nxt)
+
+                all_edges = list(graph.edges())
+                sampled_edges = rng.sample(all_edges, min(len(all_edges), rng.randint(1, 4)))
+                changes = []
+
+                for u, v in sampled_edges:
+                    old_cost = graph[u][v]["travel_time"]
+                    roll = rng.random()
+                    if roll < 0.2:
+                        new_cost = float("inf")
+                    elif roll < 0.6:
+                        # Cost decrease down to 0.5
+                        new_cost = max(0.5, old_cost * rng.uniform(0.2, 0.8))
+                    else:
+                        new_cost = old_cost * rng.uniform(1.5, 3.0)
+                    graph[u][v]["travel_time"] = new_cost
+                    changes.append((u, v, old_cost, new_cost))
+
+                planner.notify_changes(changes)
+
+                h_graph = graph.copy()
+                inf_edges = [
+                    (u, v) for u, v, d in h_graph.edges(data=True)
+                    if d.get("travel_time") == float("inf")
+                ]
+                h_graph.remove_edges_from(inf_edges)
+
+                if nx.has_path(h_graph, planner.start, planner.goal):
+                    expected = nx.shortest_path_length(
+                        h_graph, planner.start, planner.goal, weight="travel_time"
+                    )
+                    assert math.isclose(planner.cost_to_goal, expected, rel_tol=1e-5, abs_tol=1e-5), (
+                        f"Cost mismatch on decrease seed {seed}: dstar={planner.cost_to_goal}, dijkstra={expected}"
+                    )
+                else:
+                    assert planner.cost_to_goal == float("inf")
+                    assert planner.next_step() is None
+            except Exception:
+                print(f"Failed on decrease seed {seed}")
+                raise
+
+    def test_closure_disconnects_goal(self):
+        """4. A closure that disconnects the goal gives cost_to_goal == inf and next_step() is None."""
+        graph = make_grid(n=5)
+        start = (0, 0)
+        goal = (4, 4)
+
+        planner = DStarLite(graph, start, goal, heuristic=manhattan)
+        planner.initialize()
+        planner.compute_shortest_path()
+        assert planner.cost_to_goal < float("inf")
+
+        # Close all incoming edges to the goal
+        changes = []
+        for p in list(graph.predecessors(goal)):
+            old_cost = graph[p][goal]["travel_time"]
+            graph[p][goal]["travel_time"] = float("inf")
+            changes.append((p, goal, old_cost, float("inf")))
+
+        planner.notify_changes(changes)
+
+        assert planner.cost_to_goal == float("inf")
+        assert planner.next_step() is None
