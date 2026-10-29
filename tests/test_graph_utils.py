@@ -1,5 +1,10 @@
-"""Unit tests for graph utility functions: Haversine distance, node snapping,
-speeds/travel times, edge collapsing, and v_max calculation.
+"""Unit tests for graph utility functions:
+- load_graph
+- prepare_graph
+- haversine_m
+- compute_v_max
+- make_heuristic
+- snap_to_node
 """
 
 from __future__ import annotations
@@ -8,279 +13,175 @@ import math
 from pathlib import Path
 
 import networkx as nx
-import osmnx as ox
 import pytest
 
-from src.graph import Graph
 from src.graph_utils import (
-    EARTH_RADIUS_M,
-    add_edge_speeds,
-    add_edge_speeds_and_travel_times,
-    add_edge_travel_times,
-    collapse_parallel_edges,
     compute_v_max,
-    haversine,
+    haversine_m,
+    load_graph,
+    make_heuristic,
+    prepare_graph,
     snap_to_node,
 )
 
 
 @pytest.fixture(scope="module")
-def ahmedabad_graph() -> nx.MultiDiGraph:
-    """Load the Ahmedabad city graph once for module tests if available."""
-    graph_path = Path(__file__).resolve().parent.parent / "data" / "city.graphml"
-    if not graph_path.exists() or graph_path.stat().st_size == 0:
-        pytest.skip("data/city.graphml does not exist or is empty")
-    return ox.load_graphml(graph_path)
+def sample_multidigraph() -> nx.MultiDiGraph:
+    """Fixture providing a deterministic MultiDiGraph with parallel edges and coordinates."""
+    mg = nx.MultiDiGraph(crs="epsg:4326")
+    # Triangle cycle (1 -> 2 -> 3 -> 1) ensuring strong connectivity
+    # Distance between 1 and 2 is ~1023.5 metres
+    mg.add_node(1, x=72.5000, y=23.0000)
+    mg.add_node(2, x=72.5100, y=23.0000)
+    mg.add_node(3, x=72.5050, y=23.0100)
+    # Disconnected node to test SCC filtering
+    mg.add_node(99, x=72.6000, y=23.1000)
+
+    # Parallel edges from 1 -> 2 (road length >= straight line distance = 1500m):
+    # Edge 0: length 1500m, speed 30 km/h (8.33 m/s) -> travel_time = 180s
+    mg.add_edge(1, 2, key=0, length=1500.0, speed_kph=30.0, travel_time=180.0, highway="residential")
+    # Edge 1: length 1500m, speed 60 km/h (16.67 m/s) -> travel_time = 90s (faster)
+    mg.add_edge(1, 2, key=1, length=1500.0, speed_kph=60.0, travel_time=90.0, highway="primary")
+
+    # Edge 2 -> 3
+    mg.add_edge(2, 3, key=0, length=1500.0, speed_kph=40.0, travel_time=135.0, highway="secondary")
+    # Edge 3 -> 1
+    mg.add_edge(3, 1, key=0, length=1500.0, speed_kph=50.0, travel_time=108.0, highway="secondary")
+
+    # One-way edge to disconnected node (not strongly connected)
+    mg.add_edge(2, 99, key=0, length=5000.0, speed_kph=30.0, travel_time=600.0, highway="residential")
+
+    return mg
 
 
 class TestHaversineDistance:
-    """Tests for great-circle distance calculation via the Haversine formula."""
+    """Tests for haversine_m great-circle distance computation in metres."""
 
-    def test_identical_coordinates_return_zero_distance(self):
-        """Distance between identical coordinates must be exactly 0.0 metres."""
-        dist = haversine(23.0225, 72.5714, 23.0225, 72.5714)
-        assert dist == 0.0
+    def test_haversine_identical_coordinates(self):
+        """Distance between identical coordinates must be 0.0 metres."""
+        assert haversine_m(23.0225, 72.5714, 23.0225, 72.5714) == 0.0
 
-    def test_haversine_symmetry(self):
-        """haversine(A, B) must equal haversine(B, A)."""
-        lat1, lon1 = 23.0605, 72.5802
-        lat2, lon2 = 23.0063, 72.6026
-        d1 = haversine(lat1, lon1, lat2, lon2)
-        d2 = haversine(lat2, lon2, lat1, lon1)
-        assert math.isclose(d1, d2, rel_tol=1e-9)
-
-    def test_known_equatorial_distance(self):
-        """Test 1 degree of longitude along the equator against known arc length.
-
-        Arc length for 1 deg at radius R = R * (pi / 180) ≈ 111,194.9266 metres.
-        """
-        expected_distance = EARTH_RADIUS_M * (math.pi / 180.0)
-        computed_distance = haversine(0.0, 0.0, 0.0, 1.0)
-        assert math.isclose(computed_distance, expected_distance, rel_tol=1e-5)
-        # Approximately 111.19 km
-        assert 111_100 < computed_distance < 111_300
-
-    def test_known_intercity_distance_london_to_paris(self):
-        """Test London to Paris great-circle distance against standard geodetic benchmark (~343.5 km)."""
+    def test_haversine_known_benchmark_london_to_paris(self):
+        """London (51.5074, -0.1278) to Paris (48.8566, 2.3522) benchmark ~343,556 metres."""
         london = (51.5074, -0.1278)
         paris = (48.8566, 2.3522)
-        dist_m = haversine(london[0], london[1], paris[0], paris[1])
-        # Standard benchmark distance is ~343,556 metres; verify within 0.5%
+        dist_m = haversine_m(london[0], london[1], paris[0], paris[1])
+        # Validate against standard geodetic distance within 0.5% tolerance
         assert math.isclose(dist_m, 343_556, rel_tol=0.005)
 
-    @pytest.mark.parametrize(
-        "invalid_coords",
-        [
-            (95.0, 0.0, 0.0, 0.0),    # lat1 > 90
-            (-95.0, 0.0, 0.0, 0.0),   # lat1 < -90
-            (0.0, 185.0, 0.0, 0.0),   # lon1 > 180
-            (0.0, -185.0, 0.0, 0.0),  # lon1 < -180
-            (0.0, 0.0, 91.0, 0.0),    # lat2 > 90
-            (0.0, 0.0, 0.0, 181.0),   # lon2 > 180
-            (float("nan"), 0.0, 0.0, 0.0),
-            (0.0, float("inf"), 0.0, 0.0),
-        ],
-    )
-    def test_reject_out_of_bounds_or_non_finite_coordinates(self, invalid_coords):
-        with pytest.raises(ValueError):
-            haversine(*invalid_coords)
-
-    @pytest.mark.parametrize(
-        "invalid_types",
-        [
-            ("23.0", 72.0, 23.5, 72.5),
-            (23.0, None, 23.5, 72.5),
-            (True, 72.0, 23.5, 72.5),
-        ],
-    )
-    def test_reject_non_numeric_coordinates(self, invalid_types):
-        with pytest.raises(TypeError):
-            haversine(*invalid_types)
+    def test_haversine_symmetry(self):
+        """haversine_m(A, B) must equal haversine_m(B, A)."""
+        d1 = haversine_m(23.0605, 72.5802, 23.0063, 72.6026)
+        d2 = haversine_m(23.0063, 72.6026, 23.0605, 72.5802)
+        assert math.isclose(d1, d2, rel_tol=1e-9)
 
 
 class TestSnapToNode:
-    """Tests for snapping geographic coordinates to nearest network nodes."""
+    """Tests for snapping coordinates to the nearest network node."""
 
-    # Three well-known landmarks in Ahmedabad with coordinates
-    AHMEDABAD_LANDMARKS = [
-        ("Sabarmati Ashram", 23.0605, 72.5802, 300.0),
-        ("Atal Pedestrian Bridge", 23.0232, 72.5714, 200.0),
-        ("Kankaria Lake", 23.0063, 72.6026, 500.0),
-    ]
+    def test_snap_three_coordinates_within_100m(self):
+        """Snap 3 query coordinates placed close to known nodes and verify distance < 100m."""
+        g = nx.DiGraph()
+        # Define 3 reference nodes in Ahmedabad
+        g.add_node(101, x=72.5714, y=23.0225)
+        g.add_node(102, x=72.5802, y=23.0605)
+        g.add_node(103, x=72.6026, y=23.0063)
 
-    @pytest.mark.parametrize("name, lat, lon, max_distance_m", AHMEDABAD_LANDMARKS)
-    def test_snap_ahmedabad_coordinates_to_sensible_nodes(
-        self, ahmedabad_graph, name, lat, lon, max_distance_m
-    ):
-        """Verify three known Ahmedabad locations snap to valid, nearby nodes in the road network."""
-        node_id = snap_to_node(ahmedabad_graph, lat, lon)
+        # 3 query coordinates offset by ~30-50 metres
+        queries = [
+            (23.0227, 72.5716, 101),
+            (23.0607, 72.5804, 102),
+            (23.0061, 72.6024, 103),
+        ]
 
-        # Node must exist in the graph
-        assert node_id in ahmedabad_graph
-
-        # Node must have valid geographic coordinates
-        node_data = ahmedabad_graph.nodes[node_id]
-        assert "x" in node_data and "y" in node_data
-        node_lat = float(node_data["y"])
-        node_lon = float(node_data["x"])
-
-        # Distance from query point to the snapped node should be sensible (< max_distance_m)
-        dist_m = haversine(lat, lon, node_lat, node_lon)
-        assert dist_m < max_distance_m, (
-            f"{name} ({lat}, {lon}) snapped to node {node_id} ({node_lat}, {node_lon}) "
-            f"which is {dist_m:.1f}m away (expected < {max_distance_m}m)"
-        )
-
-    def test_snap_to_node_with_return_dist(self, ahmedabad_graph):
-        """Verify snap_to_node returns (node, distance) when return_dist=True."""
-        lat, lon = 23.0605, 72.5802
-        node_id, dist = snap_to_node(ahmedabad_graph, lat, lon, return_dist=True)
-
-        assert node_id in ahmedabad_graph
-        assert isinstance(dist, (int, float))
-        assert dist > 0.0
-
-        # Verify returned distance matches calculated Haversine distance
-        node_data = ahmedabad_graph.nodes[node_id]
-        expected_dist = haversine(lat, lon, float(node_data["y"]), float(node_data["x"]))
-        assert math.isclose(dist, expected_dist, rel_tol=0.01)
-
-    def test_snap_to_node_on_synthetic_graph(self):
-        """Test snapping on a small synthetic NetworkX graph."""
-        g = nx.MultiDiGraph(crs="epsg:4326")
-        g.add_node(101, x=72.50, y=23.00)
-        g.add_node(102, x=72.52, y=23.02)
-        g.add_edge(101, 102, key=0, length=100.0)
-
-        # Point very close to node 101
-        snapped = snap_to_node(g, lat=23.0001, lon=72.5001)
-        assert snapped == 101
-
-    def test_snap_to_node_on_custom_graph(self):
-        """Test snapping on custom src.graph.Graph instance."""
-        graph = Graph()
-        graph.add_node("N1", x=72.50, y=23.00)
-        graph.add_node("N2", x=72.55, y=23.05)
-        graph.add_edge("N1", "N2", cost=60.0)
-
-        # Query close to N2
-        snapped = snap_to_node(graph, lat=23.049, lon=72.551)
-        assert snapped == "N2"
-
-    @pytest.mark.parametrize("invalid_lat, invalid_lon", [(100.0, 72.0), (-91.0, 72.0), (23.0, 200.0)])
-    def test_snap_rejects_out_of_range_coordinates(self, ahmedabad_graph, invalid_lat, invalid_lon):
-        with pytest.raises(ValueError):
-            snap_to_node(ahmedabad_graph, invalid_lat, invalid_lon)
+        for q_lat, q_lon, expected_node in queries:
+            snapped_node = snap_to_node(g, q_lat, q_lon)
+            assert snapped_node == expected_node
+            node_x = g.nodes[snapped_node]["x"]
+            node_y = g.nodes[snapped_node]["y"]
+            dist_m = haversine_m(q_lat, q_lon, node_y, node_x)
+            assert dist_m <= 100.0, f"Snapped node {snapped_node} is {dist_m:.2f}m away (> 100m)"
 
 
-class TestSpeedsAndTravelTimes:
-    """Tests for adding edge speeds and calculating travel times."""
+class TestPrepareGraph:
+    """Tests for preparing road network DiGraphs from MultiDiGraphs."""
 
-    @pytest.fixture
-    def sample_network(self) -> nx.MultiDiGraph:
-        """Create a small MultiDiGraph with coordinates and length."""
-        g = nx.MultiDiGraph(crs="epsg:4326")
-        g.add_node(1, x=72.50, y=23.00)
-        g.add_node(2, x=72.51, y=23.01)
-        g.add_node(3, x=72.52, y=23.02)
+    def test_prepare_graph_returns_strongly_connected_digraph(self, sample_multidigraph):
+        """prepare_graph must return a nx.DiGraph that is strongly connected and parallel-edge free."""
+        prepared = prepare_graph(sample_multidigraph)
 
-        # Edge with explicit maxspeed
-        g.add_edge(1, 2, key=0, length=1000.0, maxspeed="50", highway="primary")
-        # Edge without explicit maxspeed
-        g.add_edge(2, 3, key=0, length=500.0, highway="residential")
-        return g
+        # Must be nx.DiGraph and strictly NOT MultiDiGraph
+        assert isinstance(prepared, nx.DiGraph)
+        assert not isinstance(prepared, nx.MultiDiGraph)
 
-    def test_add_edge_speeds(self, sample_network):
-        g = add_edge_speeds(sample_network, fallback=30.0)
-        # All edges must have speed_kph
-        for _, _, data in g.edges(data=True):
-            assert "speed_kph" in data
-            assert data["speed_kph"] > 0
+        # Exactly one edge per (u, v) pair
+        for u, v in prepared.edges():
+            assert prepared.number_of_edges(u, v) == 1
 
-    def test_add_edge_travel_times(self, sample_network):
-        g = add_edge_speeds(sample_network, fallback=30.0)
-        g = add_edge_travel_times(g)
-
-        for _, _, data in g.edges(data=True):
+        # Travel time must be positive on every edge
+        for u, v, data in prepared.edges(data=True):
             assert "travel_time" in data
-            # travel_time (s) = length (m) / (speed_kph * 1000 / 3600)
-            expected_time = data["length"] / (data["speed_kph"] * 1000.0 / 3600.0)
-            assert math.isclose(data["travel_time"], expected_time, rel_tol=1e-5)
+            assert data["travel_time"] > 0.0
 
-    def test_add_edge_speeds_and_travel_times_combined(self, sample_network):
-        g = add_edge_speeds_and_travel_times(sample_network, fallback=40.0)
-        for _, _, data in g.edges(data=True):
-            assert "speed_kph" in data
-            assert "travel_time" in data
-            assert data["travel_time"] > 0
+        # Parallel edge collapsing: 1 -> 2 had 180s and 90s; minimum (90s) must be retained
+        assert math.isclose(prepared[1][2]["travel_time"], 90.0, rel_tol=1e-3)
 
+        # Node coordinates x and y must be preserved as floats
+        for node in prepared.nodes():
+            assert "x" in prepared.nodes[node] and isinstance(prepared.nodes[node]["x"], float)
+            assert "y" in prepared.nodes[node] and isinstance(prepared.nodes[node]["y"], float)
 
-class TestCollapseParallelEdges:
-    """Tests for collapsing parallel edges by retaining minimum travel time."""
-
-    def test_collapse_parallel_edges_into_digraph(self):
-        mg = nx.MultiDiGraph(crs="epsg:4326")
-        mg.add_node(1, x=72.5, y=23.0)
-        mg.add_node(2, x=72.6, y=23.1)
-
-        # Three parallel edges between 1 and 2
-        mg.add_edge(1, 2, key=0, travel_time=60.0, name="Slow Road")
-        mg.add_edge(1, 2, key=1, travel_time=25.0, name="Expressway")
-        mg.add_edge(1, 2, key=2, travel_time=45.0, name="Avenue")
-
-        di_graph = collapse_parallel_edges(mg)
-        assert isinstance(di_graph, nx.DiGraph)
-        assert di_graph.number_of_nodes() == 2
-        assert di_graph.number_of_edges() == 1
-        assert di_graph.has_edge(1, 2)
-        assert di_graph[1][2]["travel_time"] == 25.0
-        assert di_graph[1][2]["name"] == "Expressway"
-
-    def test_collapse_parallel_edges_into_custom_graph(self):
-        mg = nx.MultiDiGraph(crs="epsg:4326")
-        mg.add_node("A", x=72.5, y=23.0)
-        mg.add_node("B", x=72.6, y=23.1)
-
-        mg.add_edge("A", "B", key=0, travel_time=40.0)
-        mg.add_edge("A", "B", key=1, travel_time=15.0)
-
-        graph = collapse_parallel_edges(mg, as_custom_graph=True)
-        assert isinstance(graph, Graph)
-        assert graph.node_count == 2
-        assert graph.edge_count == 1
-        assert graph.get_edge_cost("A", "B") == 15.0
+        # Disconnected node 99 must be pruned; only nodes {1, 2, 3} form the largest SCC
+        assert 99 not in prepared
+        assert set(prepared.nodes()) == {1, 2, 3}
+        assert nx.is_strongly_connected(prepared)
 
 
-class TestComputeVMax:
-    """Tests for calculating maximum traversal speed (v_max) in metres/second."""
+class TestLoadGraph:
+    """Tests for offline loading of GraphML files with numeric attribute conversion."""
 
-    def test_compute_v_max_from_speed_kph(self):
-        g = nx.DiGraph()
-        g.add_edge(1, 2, speed_kph=50.0, length=500.0, travel_time=36.0)
-        g.add_edge(2, 3, speed_kph=108.0, length=1000.0, travel_time=33.33)
-        g.add_edge(3, 4, speed_kph=36.0, length=200.0, travel_time=20.0)
+    def test_load_graph_converts_attributes(self, tmp_path):
+        """GraphML attributes stored as strings must be converted to float/int."""
+        # Create a small valid GraphML file with string-typed coordinates
+        raw_graph = nx.MultiDiGraph(crs="epsg:4326")
+        raw_graph.add_node(101, x="72.50", y="23.00")
+        raw_graph.add_node(102, x="72.51", y="23.01")
+        raw_graph.add_edge(101, 102, key=0, length="500.5", maxspeed="40")
 
-        # Max speed is 108.0 km/h = 108.0 / 3.6 = 30.0 m/s
-        v_max = compute_v_max(g)
-        assert math.isclose(v_max, 30.0, rel_tol=1e-5)
+        test_file = tmp_path / "test_city.graphml"
+        nx.write_graphml(raw_graph, test_file)
 
-    def test_compute_v_max_from_length_and_travel_time(self):
-        g = nx.DiGraph()
-        # 100 metres in 5 seconds = 20 m/s
-        g.add_edge(1, 2, length=100.0, travel_time=5.0)
-        # 250 metres in 10 seconds = 25 m/s
-        g.add_edge(2, 3, length=250.0, travel_time=10.0)
+        loaded = load_graph(test_file)
+        assert isinstance(loaded, (nx.MultiDiGraph, nx.DiGraph))
+        assert isinstance(loaded.nodes[101]["x"], float)
+        assert isinstance(loaded.nodes[101]["y"], float)
+        assert math.isclose(loaded.nodes[101]["x"], 72.50)
+        assert math.isclose(loaded.nodes[101]["y"], 23.00)
 
-        v_max = compute_v_max(g)
-        assert math.isclose(v_max, 25.0, rel_tol=1e-5)
 
-    def test_compute_v_max_rejects_empty_or_speedless_graph(self):
-        g = nx.DiGraph()
-        with pytest.raises(ValueError, match="Could not determine valid positive edge speeds"):
-            compute_v_max(g)
+class TestHeuristic:
+    """Tests for compute_v_max and make_heuristic."""
 
-    def test_compute_v_max_on_ahmedabad_graph(self, ahmedabad_graph):
-        g = add_edge_speeds_and_travel_times(ahmedabad_graph, fallback=30.0)
-        v_max = compute_v_max(g)
-        # In an urban road network, v_max is typically between 20 m/s (~72 km/h) and 35 m/s (~126 km/h)
-        assert 15.0 <= v_max <= 40.0
+    def test_compute_v_max_positive(self, sample_multidigraph):
+        """v_max should match the fastest edge speed in metres per second."""
+        prepared = prepare_graph(sample_multidigraph)
+        v_max = compute_v_max(prepared)
+        # In sample_multidigraph, max speed was 60 km/h = 16.666... m/s
+        assert math.isclose(v_max, 60.0 / 3.6, rel_tol=1e-3)
+
+    def test_make_heuristic_evaluates_correctly(self, sample_multidigraph):
+        """make_heuristic returns h(n, goal) in seconds that is zero at goal and admissible."""
+        prepared = prepare_graph(sample_multidigraph)
+        h = make_heuristic(prepared)
+
+        # Distance to self is 0.0s
+        assert h(1, 1) == 0.0
+
+        # Distance between distinct nodes is positive
+        h_1_to_2 = h(1, 2)
+        assert h_1_to_2 > 0.0
+
+        # Admissibility check: h(u, v) <= actual edge travel time
+        # Straight-line distance is ~1023.5m, v_max = 16.67 m/s -> h ~ 61.4s <= 90.0s
+        actual_time = prepared[1][2]["travel_time"]
+        assert h_1_to_2 <= actual_time + 1e-6
