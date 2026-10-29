@@ -185,3 +185,39 @@ class TestHeuristic:
         # Straight-line distance is ~1023.5m, v_max = 16.67 m/s -> h ~ 61.4s <= 90.0s
         actual_time = prepared[1][2]["travel_time"]
         assert h_1_to_2 <= actual_time + 1e-6
+
+
+
+class TestLazyImports:
+    """Test that osmnx and geopandas are not eagerly imported at module level."""
+
+    def test_graph_utils_and_src_importable_without_osmnx(self, monkeypatch):
+        """Importing src.graph_utils and src should not require osmnx or geopandas."""
+        import importlib
+        import sys
+
+        # Block osmnx and geopandas from being imported
+        monkeypatch.setitem(sys.modules, "osmnx", None)
+        monkeypatch.setitem(sys.modules, "geopandas", None)
+
+        # Reloading graph_utils must succeed without osmnx
+        import src.graph_utils as gu
+        importlib.reload(gu)
+
+        # Verify make_heuristic, haversine_m, compute_v_max work on tiny hand-built DiGraph
+        g = nx.DiGraph()
+        g.add_node("A", x=72.0, y=23.0)
+        g.add_node("B", x=72.01, y=23.0)
+        g.add_edge("A", "B", length=1000.0, travel_time=60.0)
+
+        h = gu.make_heuristic(g)
+        assert h("A", "A") == 0.0
+        assert h("A", "B") > 0.0
+        assert gu.haversine_m(23.0, 72.0, 23.0, 72.01) > 0.0
+        assert gu.compute_v_max(g) > 0.0
+
+        # Reloading src top-level package must also succeed without osmnx/geopandas
+        import src
+        importlib.reload(src)
+        assert hasattr(src, "make_heuristic")
+        assert hasattr(src, "plan")
