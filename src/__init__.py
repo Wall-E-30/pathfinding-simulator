@@ -1,7 +1,9 @@
 """Source package for pathfinding simulator."""
 
 from src.agent_baseline import run_baseline_agent
+from src.agent_dstar import run_dstar_agent
 from src.astar import plan, run_astar_agent
+from src.dstar_lite import DStarLite
 from src.events import Event, apply_events
 from src.graph import Graph
 from src.graph_utils import (
@@ -16,6 +18,7 @@ from src.grid import create_grid_graph
 from src.simulator import generate_events, make_scenario
 
 __all__ = [
+    "DStarLite",
     "Event",
     "Graph",
     "apply_events",
@@ -30,5 +33,6 @@ __all__ = [
     "prepare_graph",
     "run_astar_agent",
     "run_baseline_agent",
+    "run_dstar_agent",
     "snap_to_node",
 ]
