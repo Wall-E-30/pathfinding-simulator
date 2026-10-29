@@ -1,21 +1,73 @@
 # Dynamic Emergency Vehicle Rerouting on Live Street Networks
 
-A pathfinding simulation project evaluating static and dynamic routing algorithms for emergency vehicles navigating live urban road networks. Built with Python 3.11, NetworkX, OSMnx, and pytest.
+A pathfinding simulation framework comparing static and dynamic graph routing algorithms for emergency vehicles navigating live urban road networks. The system benchmarks full A* recomputation against incremental D* Lite replanning under dynamic real-time traffic disruptions. Built with Python 3.11+, NetworkX, OSMnx, Matplotlib, and Streamlit.
+
+---
+
+## Live Web Application
+
+- **Live URL**: [https://pathfinding-simulator.streamlit.app/](https://pathfinding-simulator.streamlit.app/)
+- Hosted on Streamlit Community Cloud with interactive Leaflet/Folium map rendering for route visualization and dynamic incident inspection.
+
+---
+
+## Setup & Installation
+
+### Requirements
+- **Python**: 3.11 or newer (compatible with Python 3.11–3.14).
+- Clone the repository and install the dependencies:
+
+```bash
+git clone https://github.com/Wall-E-30/pathfinding-simulator.git
+cd pathfinding-simulator
+python -m venv .venv
+source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+---
+
+## How to Run
+
+### 1. Run Unit Tests
+To execute the complete unit test suite across all modules:
+```bash
+pytest -v
+```
+
+### 2. Regenerate the App Graph
+To crop and export the lightweight strongly connected component graph from raw data:
+```bash
+python scripts/export_app_graph.py
+```
+This loads `data/city.graphml`, crops within a 2500m radius of central Ahmedabad (`23.0225, 72.5714`), extracts the largest SCC, strips unused attributes, and serializes to `data/app_graph.pkl` (protocol 4, < 25 MB).
+
+### 3. Run the CLI Simulation Demo
+To run a dynamic emergency routing scenario on the full city network:
+```bash
+python scripts/run_scenario.py --seed 0 --events 6
+```
+
+### 4. Run the Comparative Benchmark
+To execute the automated benchmark comparing Baseline A* vs. D* Lite across multiple random seeds:
+```bash
+python scripts/benchmark.py --seeds 30 --events 6 --out results
+```
+Generates tabular data in `results/benchmark.csv` and side-by-side comparison charts in `results/benchmark.png`.
+
+### 5. Run the Streamlit Web Application
+To run the interactive dashboard locally:
+```bash
+streamlit run app/app.py
+```
 
 ---
 
 ## Shared Interface Contract
 
-All routing algorithms adhere strictly to the following specification:
+All routing algorithms adhere strictly to the shared contract:
 
-### 1. Graph Representation
-- **Type**: `networkx.DiGraph` (directed graph).
-- **Edges**: Exactly **one** directed edge per `(u, v)` pair.
-- **Edge Attribute**: `"travel_time"` (travel time in seconds, non-negative float).
-- **Node Attributes**: `"x"` (longitude in degrees) and `"y"` (latitude in degrees).
-
-### 2. Algorithm Interface
-Every routing algorithm exposes a standard `plan` function:
+### 1. Static Planning Interface
 ```python
 def plan(
     graph: nx.DiGraph,
@@ -23,54 +75,61 @@ def plan(
     goal: Any,
     heuristic: Callable[[Any, Any], float] | None = None
 ) -> tuple[list[Any], float, dict[str, Any]]:
-    ...
 ```
+- **Returns**: `(path, cost, stats)` where `stats` contains `{"expansions": int, "time_ms": float}`.
+- Unreachable goals return `([], float("inf"), stats)`.
+- Identical start and goal (`start == goal`) returns `([start], 0.0, stats)`.
 
-#### Return Value
-- `path`: List of node IDs from `start` to `goal`, inclusive (e.g., `[start, ..., goal]`).
-- `cost`: Total travel time along the path in seconds (`float`).
-- `stats`: Execution statistics dictionary:
+### 2. Dynamic Agent Interface
+```python
+def run_baseline_agent(graph, start, goal, events, heuristic, verify=False) -> dict: ...
+def run_dstar_agent(graph, start, goal, events, heuristic, verify=False) -> dict: ...
+```
+- Works on `graph.copy()`, leaving caller's graph unmutated.
+- When `verify=True`, asserts after every replan that the planner's cost-to-goal matches an independent NetworkX Dijkstra search on non-`inf` edges.
+- **Return Dictionary Keys**:
   ```python
   {
-      "expansions": int,   # Total number of nodes popped and expanded from priority queue
-      "time_ms": float     # Total wall-clock execution time in milliseconds
+      "status": "reached" | "stuck" | "max_steps",
+      "path_taken": list[Any],
+      "travel_time": float,          # Sum of edge costs at moment traversed
+      "steps": int,
+      "replans": int,
+      "initial_expansions": int,
+      "replan_expansions": int,
+      "total_expansions": int,
+      "replan_latencies_ms": list[float],
+      "total_replan_time_ms": float,
   }
   ```
 
-#### Edge Cases
-- **Unreachable Goal**: Returns `([], float("inf"), stats)`.
-- **Identical Start and Goal (`start == goal`)**: Returns `([start], 0.0, stats)`.
+---
 
-### 3. Heuristic Function
-For informed search algorithms (such as A*), the admissible travel-time heuristic is defined as:
-```python
-h(n, goal) = haversine_m(n, goal) / v_max
-```
-- `haversine_m`: Great-circle distance in metres between node `n` and `goal`.
-- `v_max`: Maximum permissible traversal speed (m/s) across all edges in the graph.
-- Units: Seconds.
-- Guarantee: Admissible and consistent because straight-line distance divided by the network's maximum theoretical speed never overestimates the true travel time.
+## Time Model and Cost Semantics
 
+1. **Edge Cost Semantics**:
+   - **Road Closure**: `travel_time = float("inf")`. All algorithms treat `inf` edges as impassable/blocked.
+   - **Congestion**: `new_cost = base_cost * multiplier` where `multiplier ∈ [1.5, 5.0]` and `base_cost` is the edge cost in the original graph.
+   - **Admissibility Condition**: Edge costs never drop below `base_cost`, ensuring the Euclidean/Haversine heuristic remains strictly admissible.
+2. **Discrete Time Model**:
+   - Counter $t \ge 1$ tracks moves made.
+   - Events with `step == t` are applied when the vehicle reaches its $t$-th node, **before** selecting its next move.
+   - **Omniscient Sensing**: All network disruptions are sensed immediately by the agent upon occurrence.
 
 ---
 
-## Interactive Streamlit Web Application
+## Benchmark Results
 
-An interactive web interface is provided in `app/app.py` for map visualization and simulation inspection.
+Comprehensive 30-seed benchmark metrics comparing Baseline full A* recomputation against incremental D* Lite:
+- See [`results/benchmark.csv`](results/benchmark.csv) for raw per-seed run data.
+- See [`results/benchmark.png`](results/benchmark.png) for graphical comparison of mean replan expansions and latencies.
 
-### Running Locally
-To run the Streamlit application:
-```bash
-streamlit run app/app.py
-```
+---
 
-### Deployment on Streamlit Community Cloud
-1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
-2. Click **Create app** and select the repository: `Wall-E-30/pathfinding-simulator`.
-3. Set **Main file path** to:
-   ```text
-   app/app.py
-   ```
-4. Under **Advanced settings**, set the **Python version** to **3.11** or **3.12**.
-5. Click **Deploy!**
-   - The deployment will use `app/requirements.txt` which contains only lightweight packages (`streamlit`, `folium`, `streamlit-folium`, `networkx`, `numpy`), completely avoiding heavy GIS compilation issues.
+## Limitations and Future Work
+
+1. **No ALT or Bidirectional A\***: A* currently uses forward search with a Haversine heuristic; landmark-based (ALT) or bidirectional dynamic search is not yet implemented.
+2. **Single-Vehicle Focus**: Current routing algorithms model a single emergency vehicle; multi-vehicle fleet coordination and congestion feedback loops are omitted.
+3. **Synthetic Incidents**: Road closures and congestion events are synthetically generated using seeded pseudo-random patterns rather than live municipal traffic feeds.
+4. **Full-Information Instant Sensing**: Changes are assumed to be sensed immediately across the network without communication horizons, sensor latency, or radio range limits.
+5. **Memory Profiling**: Performance evaluation benchmarks node expansions and execution latency; memory heap footprint profiling of D* Lite priority queues has not been quantified.
