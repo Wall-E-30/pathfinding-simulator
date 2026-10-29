@@ -1,5 +1,6 @@
 """Source package for pathfinding simulator."""
 
+from src.agent_baseline import run_baseline_agent
 from src.astar import plan, run_astar_agent
 from src.events import Event, apply_events
 from src.graph import Graph
@@ -28,5 +29,6 @@ __all__ = [
     "plan",
     "prepare_graph",
     "run_astar_agent",
+    "run_baseline_agent",
     "snap_to_node",
 ]

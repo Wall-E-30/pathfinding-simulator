@@ -201,3 +201,4 @@ def make_scenario(
     raise ValueError(
         f"Could not find a path with at least {min_hops} hops after {MAX_ATTEMPTS} attempts."
     )
+
