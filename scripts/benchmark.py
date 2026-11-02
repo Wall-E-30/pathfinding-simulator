@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 
 from src.agent_baseline import run_baseline_agent
 from src.agent_dstar import run_dstar_agent
-from src.graph_utils import make_heuristic
+from src.graph_utils import load_graph, make_heuristic, prepare_graph
 from src.simulator import make_scenario
 
 CSV_COLUMNS = [
@@ -193,6 +193,18 @@ def plot_benchmark(rows: List[Dict[str, Any]], output_png: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run comprehensive benchmark comparing Baseline A* vs D* Lite.")
+    parser.add_argument(
+        "--graph",
+        type=str,
+        default="data/app_graph.pkl",
+        help="Path to graph file (.pkl or .graphml) (default: data/app_graph.pkl)",
+    )
+    parser.add_argument(
+        "--out-name",
+        type=str,
+        default="benchmark",
+        help="Base name for output CSV and PNG without extension (default: benchmark)",
+    )
     parser.add_argument("--seeds", type=int, default=30, help="Number of seeds to evaluate (default: 30)")
     parser.add_argument("--events", type=int, default=6, help="Number of dynamic events per scenario (default: 6)")
     parser.add_argument("--out", type=str, default="results", help="Output directory for CSV and PNG (default: results)")
@@ -200,18 +212,30 @@ def main() -> None:
 
     out_dir = project_root / args.out
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_file = out_dir / "benchmark.csv"
-    png_file = out_dir / "benchmark.png"
+    csv_file = out_dir / f"{args.out_name}.csv"
+    png_file = out_dir / f"{args.out_name}.png"
 
-    # 1. Load data/app_graph.pkl
-    graph_path = project_root / "data" / "app_graph.pkl"
+    # 1. Resolve and load graph file (.graphml or .pkl)
+    graph_path = Path(args.graph)
+    if not graph_path.is_absolute():
+        graph_path = project_root / graph_path
+
     if not graph_path.exists():
-        print(f"Error: Prepared graph {graph_path} not found. Run scripts/export_app_graph.py first.", file=sys.stderr)
+        print(f"Error: Graph file {graph_path} not found.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loading prepared app graph from {graph_path}...")
-    with open(graph_path, "rb") as f:
-        graph = pickle.load(f)
+    if str(graph_path).endswith(".graphml"):
+        print(f"Loading raw street network from {graph_path}...")
+        raw_graph = load_graph(graph_path)
+        print("Preparing road network DiGraph (speeds, travel times, SCC)...")
+        graph = prepare_graph(raw_graph)
+    elif str(graph_path).endswith(".pkl"):
+        print(f"Loading prepared app graph from {graph_path}...")
+        with open(graph_path, "rb") as f:
+            graph = pickle.load(f)
+    else:
+        print(f"Error: Unsupported graph format for {graph_path}. Expected .pkl or .graphml", file=sys.stderr)
+        sys.exit(1)
 
     heuristic = make_heuristic(graph)
     print(f"Graph loaded: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges.\n")
@@ -291,14 +315,14 @@ def main() -> None:
     if verification_passed and verified_seeds > 0:
         print(f"Dijkstra cross-check on first {verified_seeds} seeds: verified OK\n")
 
-    # 5. Write results/benchmark.csv
+    # 5. Write results CSV
     print(f"Writing results to {csv_file}...")
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
 
-    # 6. Generate results/benchmark.png
+    # 6. Generate results PNG
     print(f"Generating plot at {png_file}...")
     plot_benchmark(rows, png_file)
 
@@ -325,4 +349,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
